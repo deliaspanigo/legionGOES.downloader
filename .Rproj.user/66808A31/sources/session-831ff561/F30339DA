@@ -1,0 +1,27 @@
+{
+    "id": "F30339DA",
+    "path": "C:/Users/Legion/bulk/MyTesis/f01_software/f01_installer_legion/R_space/subpackages/pack_legionGOES.downloader/legionGOES.downloader/R/goes_core_new_download.R",
+    "project_path": "R/goes_core_new_download.R",
+    "type": "r_source",
+    "hash": "1324484017",
+    "contents": "",
+    "dirty": false,
+    "created": 1780001001624.0,
+    "source_on_save": false,
+    "relative_order": 12,
+    "properties": {
+        "tempName": "Untitled2",
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "9,3",
+        "scrollLine": "0"
+    },
+    "folds": "11|51|13|2|\n",
+    "lastKnownWriteTime": 1780001187,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1780003424122,
+    "read_only": false,
+    "read_only_alternatives": []
+}

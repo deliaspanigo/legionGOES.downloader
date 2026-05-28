@@ -1,0 +1,1309 @@
+# ==============================================================================
+# GOES CATALOG + DOWNLOAD CORE
+# File: R/goes_catalog_download_core.R
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Required external functions from your package/core
+# ------------------------------------------------------------------------------
+
+goes_cd_required_functions <- function() {
+  c(
+    "goes_product_code",
+    "goes_make_day_prefix",
+    "goes_list_s3_prefix_paginated"
+  )
+}
+
+goes_cd_check_core <- function() {
+
+  required <- goes_cd_required_functions()
+
+  missing <- required[
+    !vapply(
+      required,
+      function(fn) exists(fn, mode = "function", inherits = TRUE),
+      logical(1)
+    )
+  ]
+
+  if (length(missing) > 0) {
+    stop(
+      "Missing required functions: ",
+      paste(missing, collapse = ", ")
+    )
+  }
+
+  invisible(TRUE)
+}
+
+# ------------------------------------------------------------------------------
+# Basic helpers
+# ------------------------------------------------------------------------------
+
+goes_cd_now_utc <- function() {
+  as.POSIXct(
+    format(Sys.time(), tz = "UTC", usetz = FALSE),
+    tz = "UTC"
+  )
+}
+
+goes_cd_now_utc_chr <- function() {
+  format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+}
+
+goes_cd_format_utc <- function(x) {
+  format(as.POSIXct(x, tz = "UTC"), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+}
+
+goes_cd_parse_utc_chr <- function(x) {
+  as.POSIXct(
+    gsub("Z$", "", gsub("T", " ", x)),
+    tz = "UTC"
+  )
+}
+
+goes_cd_safe_nrow <- function(x) {
+  if (is.null(x) || !is.data.frame(x)) return(0L)
+  nrow(x)
+}
+
+goes_cd_safe_file_size <- function(path) {
+  if (is.null(path) || is.na(path) || !nzchar(path) || !file.exists(path)) {
+    return(NA_real_)
+  }
+  as.numeric(file.info(path)$size)
+}
+
+goes_cd_project_root_from_data_raw <- function(data_raw_dir) {
+
+  data_raw_dir <- normalizePath(
+    data_raw_dir,
+    winslash = "/",
+    mustWork = FALSE
+  )
+
+  if (basename(data_raw_dir) == "data_raw") {
+    return(dirname(data_raw_dir))
+  }
+
+  dirname(data_raw_dir)
+}
+
+goes_cd_catalog_base_dir <- function(data_raw_dir) {
+  file.path(
+    goes_cd_project_root_from_data_raw(data_raw_dir),
+    "catalog_raw"
+  )
+}
+
+# ------------------------------------------------------------------------------
+# GOES satellite table
+# ------------------------------------------------------------------------------
+
+
+
+fn_goes_resolve_satellite_by_time <- function(position, time_utc) {
+
+  # POSITION - WEST or EAST
+  # TIME UTC - as.POSIXct("2026-01-03 00:00:00", tz = "UTC")
+
+  # HARDCODED
+  ###################################################################################
+  goes_cd_satellite_table <- data.frame(
+    position = c("EAST", "EAST", "WEST", "WEST"),
+    satellite = c("GOES-16", "GOES-19", "GOES-17", "GOES-18"),
+    bucket = c("noaa-goes16", "noaa-goes19", "noaa-goes17", "noaa-goes18"),
+    start_utc = as.POSIXct(
+      c(
+        "2017-12-18 00:00:00",
+        "2025-04-07 15:00:00",
+        "2019-02-12 00:00:00",
+        "2023-01-04 18:00:00"
+      ),
+      tz = "UTC"
+    ),
+    end_utc = as.POSIXct(
+      c(
+        "2025-04-07 15:00:00",
+        NA,
+        "2023-01-04 18:00:00",
+        NA
+      ),
+      tz = "UTC"
+    ),
+    stringsAsFactors = FALSE
+  )
+  ###################################################################################
+
+
+  time_utc <- as.POSIXct(time_utc, tz = "UTC")
+
+  out <- lapply(seq_along(time_utc), function(i) {
+
+    x <- goes_cd_satellite_table[
+      goes_cd_satellite_table$position == position,
+      ,
+      drop = FALSE
+    ]
+
+    end_aux <- x$end_utc
+    end_aux[is.na(end_aux)] <- as.POSIXct("9999-12-31 00:00:00", tz = "UTC")
+
+    ok <- time_utc[[i]] >= x$start_utc & time_utc[[i]] < end_aux
+
+    if (!any(ok)) {
+      return(data.frame(
+        satellite = NA_character_,
+        bucket = NA_character_,
+        stringsAsFactors = FALSE
+      ))
+    }
+
+    data.frame(
+      satellite = x$satellite[ok][1],
+      bucket = x$bucket[ok][1],
+      stringsAsFactors = FALSE
+    )
+  })
+
+  do.call(rbind, out)
+}
+
+# ------------------------------------------------------------------------------
+# GOES filename time parser
+# ------------------------------------------------------------------------------
+
+goes_cd_parse_goes_start_time <- function(file) {
+
+  stamp <- sub("^.*_s([0-9]{13,14}).*$", "\\1", file)
+  bad <- !grepl("^[0-9]{13,14}$", stamp)
+
+  out <- rep(
+    as.POSIXct(NA_real_, origin = "1970-01-01", tz = "UTC"),
+    length(file)
+  )
+
+  if (all(bad)) {
+    return(out)
+  }
+
+  stamp_ok <- stamp[!bad]
+
+  year <- as.integer(substr(stamp_ok, 1, 4))
+  jday <- as.integer(substr(stamp_ok, 5, 7))
+  hour <- as.integer(substr(stamp_ok, 8, 9))
+  minute <- as.integer(substr(stamp_ok, 10, 11))
+  second <- as.integer(substr(stamp_ok, 12, 13))
+
+  day <- as.Date(
+    jday - 1,
+    origin = sprintf("%04d-01-01", year)
+  )
+
+  out[!bad] <- as.POSIXct(
+    paste(day, sprintf("%02d:%02d:%02d", hour, minute, second)),
+    tz = "UTC"
+  )
+
+  out
+}
+
+# ------------------------------------------------------------------------------
+# Product expected grids
+# ------------------------------------------------------------------------------
+
+goes_cd_expected_times <- function(product, date) {
+
+  date <- as.Date(date)
+
+  if (identical(product, "LSTF")) {
+
+    times <- as.POSIXct(
+      paste(date, sprintf("%02d:00:00", 0:23)),
+      tz = "UTC"
+    )
+
+  } else if (product %in% c("MCMIPF", "FDCF")) {
+
+    hh <- rep(0:23, each = 6)
+    mm <- rep(seq(0, 50, by = 10), times = 24)
+
+    times <- as.POSIXct(
+      paste(date, sprintf("%02d:%02d:00", hh, mm)),
+      tz = "UTC"
+    )
+
+  } else if (identical(product, "GLM")) {
+
+    hh <- rep(0:23, each = 60 * 3)
+    mm <- rep(rep(0:59, each = 3), times = 24)
+    ss <- rep(c(0, 20, 40), times = 24 * 60)
+
+    times <- as.POSIXct(
+      paste(date, sprintf("%02d:%02d:%02d", hh, mm, ss)),
+      tz = "UTC"
+    )
+
+  } else {
+    stop("Unknown product: ", product)
+  }
+
+  times
+}
+
+goes_cd_catalog_slot_key <- function(product, time_utc) {
+
+  time_utc <- as.POSIXct(time_utc, tz = "UTC")
+
+  yj <- format(time_utc, "%Y%j", tz = "UTC")
+  hh <- format(time_utc, "%H", tz = "UTC")
+  mm_num <- as.integer(format(time_utc, "%M", tz = "UTC"))
+  ss_num <- as.integer(format(time_utc, "%S", tz = "UTC"))
+
+  if (identical(product, "LSTF")) {
+    return(paste(yj, hh, sep = "_"))
+  }
+
+  if (product %in% c("MCMIPF", "FDCF")) {
+    mm_slot <- sprintf("%02d", floor(mm_num / 10) * 10)
+    return(paste(yj, hh, mm_slot, sep = "_"))
+  }
+
+  if (identical(product, "GLM")) {
+    ss_slot <- ifelse(ss_num < 20, 0L, ifelse(ss_num < 40, 20L, 40L))
+    return(paste(yj, hh, sprintf("%02d", mm_num), sprintf("%02d", ss_slot), sep = "_"))
+  }
+
+  format(time_utc, "%Y%j%H%M%S", tz = "UTC")
+}
+
+goes_cd_make_catalog_id <- function(bucket, product_code, year, julian_day, slot_key) {
+  paste(
+    bucket,
+    product_code,
+    sprintf("%04d", as.integer(year)),
+    sprintf("%03d", as.integer(julian_day)),
+    slot_key,
+    sep = "|"
+  )
+}
+
+goes_cd_expected_local_path <- function(
+    data_raw_dir,
+    bucket,
+    product_code,
+    year,
+    julian_day,
+    start_time_utc,
+    filename
+) {
+
+  if (
+    is.na(bucket) ||
+    is.na(product_code) ||
+    is.na(filename) ||
+    !nzchar(filename)
+  ) {
+    return(NA_character_)
+  }
+
+  hour <- format(as.POSIXct(start_time_utc, tz = "UTC"), "%H", tz = "UTC")
+
+  file.path(
+    normalizePath(data_raw_dir, winslash = "/", mustWork = FALSE),
+    bucket,
+    product_code,
+    sprintf("%04d", as.integer(year)),
+    sprintf("%03d", as.integer(julian_day)),
+    hour,
+    filename
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Build full expected catalog
+# ------------------------------------------------------------------------------
+
+goes_cd_build_expected_catalog_product_day <- function(
+    product,
+    position,
+    date
+) {
+
+  product_code <- goes_product_code(product)
+  times <- goes_cd_expected_times(product, date)
+
+  sat <- fn_goes_cd_resolve_satellite_time(
+    position = position,
+    time_utc = times
+  )
+
+  year <- as.integer(format(as.Date(date), "%Y"))
+  julian_day <- sprintf("%03d", as.integer(format(as.Date(date), "%j")))
+  slot_key <- goes_cd_catalog_slot_key(product, times)
+
+  bucket <- sat$bucket
+  satellite <- sat$satellite
+
+  bucket[is.na(bucket)] <- "unknown_bucket"
+  satellite[is.na(satellite)] <- "unknown_satellite"
+
+  data.frame(
+    catalog_id = goes_cd_make_catalog_id(
+      bucket = bucket,
+      product_code = product_code,
+      year = year,
+      julian_day = julian_day,
+      slot_key = slot_key
+    ),
+    slot_key = slot_key,
+
+    position = position,
+    satellite = satellite,
+    bucket = bucket,
+    product = product,
+    product_code = product_code,
+
+    year = year,
+    julian_day = julian_day,
+    gregorian_date = as.character(as.Date(date)),
+
+    expected_time_utc = goes_cd_format_utc(times),
+    hour = format(times, "%H", tz = "UTC"),
+    minute = format(times, "%M", tz = "UTC"),
+    second = format(times, "%S", tz = "UTC"),
+    expected = TRUE,
+
+    online_checked = FALSE,
+    online_found = FALSE,
+    online_filename = NA_character_,
+    online_key = NA_character_,
+    online_url = NA_character_,
+    online_size_bytes = NA_real_,
+    online_start_time_utc = NA_character_,
+
+    local_checked = FALSE,
+    local_found = FALSE,
+    local_filename = NA_character_,
+    local_path = NA_character_,
+    local_size_bytes = NA_real_,
+    size_match = NA,
+
+    download_action = NA_character_,
+    download_status = NA_character_,
+    downloaded_at_utc = NA_character_,
+    download_error = NA_character_,
+
+    catalog_status = "expected_not_checked_online",
+    last_checked_at_utc = goes_cd_now_utc_chr(),
+
+    stringsAsFactors = FALSE
+  )
+}
+
+goes_cd_selected_dates_from_params <- function(params) {
+
+  from_date <- as.Date(params$from_utc, tz = "UTC")
+  to_date <- as.Date(params$to_utc, tz = "UTC")
+
+  seq.Date(
+    from = from_date,
+    to = to_date,
+    by = "day"
+  )
+}
+
+goes_cd_products_from_params <- function(params) {
+
+  if (!is.null(params$products)) {
+    return(params$products)
+  }
+
+  params$product
+}
+
+goes_cd_build_expected_catalog <- function(params) {
+
+  products <- goes_cd_products_from_params(params)
+  dates <- goes_cd_selected_dates_from_params(params)
+
+  out <- list()
+  k <- 1L
+
+  for (p in products) {
+    for (i in seq_along(dates)) {
+
+      date_now <- dates[i]
+
+      out[[k]] <- goes_cd_build_expected_catalog_product_day(
+        product = p,
+        position = params$position,
+        date = date_now
+      )
+
+      k <- k + 1L
+    }
+  }
+
+  do.call(rbind, out)
+}
+
+# ------------------------------------------------------------------------------
+# Local file discovery
+# ------------------------------------------------------------------------------
+
+goes_cd_list_local_group <- function(
+    data_raw_dir,
+    bucket,
+    product_code,
+    year,
+    julian_day,
+    product
+) {
+
+  if (is.na(bucket) || bucket == "unknown_bucket") {
+    return(data.frame())
+  }
+
+  base_dir <- file.path(
+    normalizePath(data_raw_dir, winslash = "/", mustWork = FALSE),
+    bucket,
+    product_code,
+    sprintf("%04d", as.integer(year)),
+    sprintf("%03d", as.integer(julian_day))
+  )
+
+  if (!dir.exists(base_dir)) {
+    return(data.frame())
+  }
+
+  files <- list.files(
+    base_dir,
+    pattern = "\\.nc$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+
+  if (length(files) == 0) {
+    return(data.frame())
+  }
+
+  filenames <- basename(files)
+  start_time <- goes_cd_parse_goes_start_time(filenames)
+  ok <- !is.na(start_time)
+
+  if (!any(ok)) {
+    return(data.frame())
+  }
+
+  files <- files[ok]
+  filenames <- filenames[ok]
+  start_time <- start_time[ok]
+
+  data.frame(
+    slot_key = goes_cd_catalog_slot_key(product, start_time),
+    local_filename = filenames,
+    local_path = normalizePath(files, winslash = "/", mustWork = FALSE),
+    local_size_bytes = vapply(files, goes_cd_safe_file_size, numeric(1)),
+    local_start_time_utc = goes_cd_format_utc(start_time),
+    stringsAsFactors = FALSE
+  )
+}
+
+goes_cd_apply_local_status <- function(catalog, data_raw_dir) {
+
+  if (is.null(catalog) || nrow(catalog) == 0) {
+    return(catalog)
+  }
+
+  catalog$local_checked <- TRUE
+  catalog$local_found <- FALSE
+  catalog$local_filename <- NA_character_
+  catalog$local_path <- NA_character_
+  catalog$local_size_bytes <- NA_real_
+  catalog$size_match <- NA
+
+  group_key <- paste(
+    catalog$bucket,
+    catalog$product_code,
+    catalog$year,
+    catalog$julian_day,
+    catalog$product,
+    sep = "|"
+  )
+
+  groups <- split(seq_len(nrow(catalog)), group_key)
+
+  for (idx in groups) {
+
+    x <- catalog[idx, , drop = FALSE]
+
+    local <- goes_cd_list_local_group(
+      data_raw_dir = data_raw_dir,
+      bucket = x$bucket[[1]],
+      product_code = x$product_code[[1]],
+      year = x$year[[1]],
+      julian_day = x$julian_day[[1]],
+      product = x$product[[1]]
+    )
+
+    if (nrow(local) > 0) {
+      local <- local[!duplicated(local$slot_key), , drop = FALSE]
+      m <- match(x$slot_key, local$slot_key)
+      found <- !is.na(m)
+
+      if (any(found)) {
+        catalog$local_found[idx[found]] <- TRUE
+        catalog$local_filename[idx[found]] <- local$local_filename[m[found]]
+        catalog$local_path[idx[found]] <- local$local_path[m[found]]
+        catalog$local_size_bytes[idx[found]] <- local$local_size_bytes[m[found]]
+      }
+    }
+  }
+
+  # If online file exists, define expected local path even when missing
+  for (i in seq_len(nrow(catalog))) {
+
+    if (
+      isTRUE(catalog$online_found[[i]]) &&
+      !is.na(catalog$online_filename[[i]]) &&
+      nzchar(catalog$online_filename[[i]])
+    ) {
+
+      start_time <- if (!is.na(catalog$online_start_time_utc[[i]])) {
+        goes_cd_parse_utc_chr(catalog$online_start_time_utc[[i]])
+      } else {
+        goes_cd_parse_utc_chr(catalog$expected_time_utc[[i]])
+      }
+
+      expected_path <- goes_cd_expected_local_path(
+        data_raw_dir = data_raw_dir,
+        bucket = catalog$bucket[[i]],
+        product_code = catalog$product_code[[i]],
+        year = catalog$year[[i]],
+        julian_day = catalog$julian_day[[i]],
+        start_time_utc = start_time,
+        filename = catalog$online_filename[[i]]
+      )
+
+      if (!is.na(expected_path) && nzchar(expected_path)) {
+
+        if (!isTRUE(catalog$local_found[[i]])) {
+          catalog$local_path[[i]] <- expected_path
+        }
+
+        if (file.exists(expected_path)) {
+          catalog$local_found[[i]] <- TRUE
+          catalog$local_filename[[i]] <- basename(expected_path)
+          catalog$local_path[[i]] <- normalizePath(expected_path, winslash = "/", mustWork = FALSE)
+          catalog$local_size_bytes[[i]] <- goes_cd_safe_file_size(expected_path)
+        }
+      }
+    }
+
+    if (
+      isTRUE(catalog$local_found[[i]]) &&
+      !is.na(catalog$local_size_bytes[[i]]) &&
+      !is.na(catalog$online_size_bytes[[i]])
+    ) {
+      catalog$size_match[[i]] <- catalog$local_size_bytes[[i]] == catalog$online_size_bytes[[i]]
+    }
+  }
+
+  goes_cd_update_catalog_status(catalog)
+}
+
+# ------------------------------------------------------------------------------
+# Online listing and matching
+# ------------------------------------------------------------------------------
+
+goes_cd_list_online_group <- function(
+    bucket,
+    product_code,
+    product,
+    year,
+    julian_day,
+    max_pages = 20
+) {
+
+  if (is.na(bucket) || bucket == "unknown_bucket") {
+    return(data.frame())
+  }
+
+  prefix <- goes_make_day_prefix(
+    product_code = product_code,
+    year = as.integer(year),
+    julian_day = as.integer(julian_day)
+  )
+
+  online <- goes_list_s3_prefix_paginated(
+    bucket = bucket,
+    prefix = prefix,
+    max_pages = max_pages
+  )
+
+  if (is.null(online) || nrow(online) == 0) {
+    return(data.frame())
+  }
+
+  if (!"key" %in% names(online)) {
+    online$key <- NA_character_
+  }
+
+  if (!"file" %in% names(online)) {
+    online$file <- basename(online$key)
+  }
+
+  if (!"size_online" %in% names(online)) {
+    if ("size" %in% names(online)) {
+      online$size_online <- online$size
+    } else {
+      online$size_online <- NA_real_
+    }
+  }
+
+  if (!"url" %in% names(online)) {
+    online$url <- paste0("https://", bucket, ".s3.amazonaws.com/", online$key)
+  }
+
+  online$start_time_utc <- goes_cd_parse_goes_start_time(online$file)
+  online <- online[!is.na(online$start_time_utc), , drop = FALSE]
+
+  if (nrow(online) == 0) {
+    return(data.frame())
+  }
+
+  online$slot_key <- goes_cd_catalog_slot_key(product, online$start_time_utc)
+  online <- online[order(online$start_time_utc, online$file), , drop = FALSE]
+  online <- online[!duplicated(online$slot_key), , drop = FALSE]
+
+  online
+}
+
+goes_cd_update_catalog_with_online <- function(
+    catalog,
+    max_pages = 20,
+    log_fun = message
+) {
+
+  if (is.null(catalog) || nrow(catalog) == 0) {
+    return(catalog)
+  }
+
+  group_key <- paste(
+    catalog$bucket,
+    catalog$product_code,
+    catalog$product,
+    catalog$year,
+    catalog$julian_day,
+    sep = "|"
+  )
+
+  groups <- split(seq_len(nrow(catalog)), group_key)
+
+  for (idx in groups) {
+
+    x <- catalog[idx, , drop = FALSE]
+
+    bucket <- x$bucket[[1]]
+    product_code <- x$product_code[[1]]
+    product <- x$product[[1]]
+    year <- x$year[[1]]
+    julian_day <- x$julian_day[[1]]
+
+    log_fun(sprintf(
+      "Listing online: %s | %s | %s | %s",
+      bucket,
+      product_code,
+      year,
+      julian_day
+    ))
+
+    catalog$online_checked[idx] <- TRUE
+
+    online <- tryCatch(
+      goes_cd_list_online_group(
+        bucket = bucket,
+        product_code = product_code,
+        product = product,
+        year = year,
+        julian_day = julian_day,
+        max_pages = max_pages
+      ),
+      error = function(e) {
+        log_fun(paste("Online listing error:", conditionMessage(e)))
+        data.frame()
+      }
+    )
+
+    if (nrow(online) == 0) {
+      next
+    }
+
+    m <- match(x$slot_key, online$slot_key)
+    found <- !is.na(m)
+
+    if (any(found)) {
+      ii <- idx[found]
+      mm <- m[found]
+
+      catalog$online_found[ii] <- TRUE
+      catalog$online_filename[ii] <- online$file[mm]
+      catalog$online_key[ii] <- online$key[mm]
+      catalog$online_url[ii] <- online$url[mm]
+      catalog$online_size_bytes[ii] <- online$size_online[mm]
+      catalog$online_start_time_utc[ii] <- goes_cd_format_utc(online$start_time_utc[mm])
+    }
+  }
+
+  catalog$last_checked_at_utc <- goes_cd_now_utc_chr()
+  goes_cd_update_catalog_status(catalog)
+}
+
+# ------------------------------------------------------------------------------
+# Catalog status
+# ------------------------------------------------------------------------------
+
+goes_cd_update_catalog_status <- function(catalog) {
+
+  if (is.null(catalog) || nrow(catalog) == 0) {
+    return(catalog)
+  }
+
+  now_utc <- goes_cd_now_utc()
+  expected_time <- goes_cd_parse_utc_chr(catalog$expected_time_utc)
+
+  status <- rep("expected_not_checked_online", nrow(catalog))
+
+  status[catalog$bucket == "unknown_bucket"] <- "satellite_unknown"
+
+  status[
+    catalog$online_checked &
+      !catalog$online_found &
+      expected_time > now_utc
+  ] <- "expected_future_time"
+
+  status[
+    catalog$online_checked &
+      !catalog$online_found &
+      expected_time <= now_utc
+  ] <- "expected_missing_online"
+
+  status[
+    catalog$online_found &
+      !catalog$local_found
+  ] <- "expected_online_missing_local"
+
+  status[
+    catalog$online_found &
+      catalog$local_found &
+      isTRUE(catalog$size_match)
+  ] <- "expected_online_local"
+
+  status[
+    catalog$online_found &
+      catalog$local_found &
+      !is.na(catalog$size_match) &
+      !catalog$size_match
+  ] <- "expected_online_local_size_mismatch"
+
+  status[
+    !catalog$online_found &
+      catalog$local_found
+  ] <- "expected_missing_online_local_exists"
+
+  catalog$catalog_status <- status
+  catalog
+}
+
+# ------------------------------------------------------------------------------
+# Catalog read/write
+# ------------------------------------------------------------------------------
+
+goes_cd_catalog_group_dir <- function(
+    catalog_base_dir,
+    bucket,
+    product_code,
+    year,
+    julian_day
+) {
+  file.path(
+    catalog_base_dir,
+    bucket,
+    product_code,
+    sprintf("%04d", as.integer(year)),
+    sprintf("%03d", as.integer(julian_day))
+  )
+}
+
+goes_cd_empty_catalog <- function() {
+  data.frame()
+}
+
+goes_cd_read_catalog_csv <- function(path) {
+
+  if (!file.exists(path)) {
+    return(goes_cd_empty_catalog())
+  }
+
+  utils::read.csv(
+    path,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+}
+
+goes_cd_merge_catalog <- function(old, new) {
+
+  if (is.null(old) || !is.data.frame(old) || nrow(old) == 0) {
+    return(new)
+  }
+
+  if (is.null(new) || !is.data.frame(new) || nrow(new) == 0) {
+    return(old)
+  }
+
+  all_cols <- union(names(old), names(new))
+
+  for (nm in setdiff(all_cols, names(old))) {
+    old[[nm]] <- NA
+  }
+
+  for (nm in setdiff(all_cols, names(new))) {
+    new[[nm]] <- NA
+  }
+
+  old <- old[, all_cols, drop = FALSE]
+  new <- new[, all_cols, drop = FALSE]
+
+  old <- old[!old$catalog_id %in% new$catalog_id, , drop = FALSE]
+  out <- rbind(old, new)
+
+  out <- out[order(
+    out$product,
+    out$year,
+    out$julian_day,
+    out$expected_time_utc,
+    out$online_filename
+  ), , drop = FALSE]
+
+  rownames(out) <- NULL
+  out
+}
+
+goes_cd_write_catalog <- function(catalog, catalog_base_dir) {
+
+  if (is.null(catalog) || nrow(catalog) == 0) {
+    return(data.frame())
+  }
+
+  catalog_base_dir <- normalizePath(
+    catalog_base_dir,
+    winslash = "/",
+    mustWork = FALSE
+  )
+
+  group_key <- paste(
+    catalog$bucket,
+    catalog$product_code,
+    catalog$year,
+    catalog$julian_day,
+    sep = "|"
+  )
+
+  groups <- split(catalog, group_key)
+
+  manifest <- lapply(groups, function(x) {
+
+    bucket <- x$bucket[[1]]
+    product_code <- x$product_code[[1]]
+    year <- x$year[[1]]
+    julian_day <- x$julian_day[[1]]
+
+    out_dir <- goes_cd_catalog_group_dir(
+      catalog_base_dir = catalog_base_dir,
+      bucket = bucket,
+      product_code = product_code,
+      year = year,
+      julian_day = julian_day
+    )
+
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+    csv_path <- file.path(out_dir, "catalog.csv")
+    old <- goes_cd_read_catalog_csv(csv_path)
+    merged <- goes_cd_merge_catalog(old, x)
+
+    utils::write.csv(
+      merged,
+      csv_path,
+      row.names = FALSE,
+      fileEncoding = "UTF-8"
+    )
+
+    data.frame(
+      bucket = bucket,
+      product_code = product_code,
+      year = as.integer(year),
+      julian_day = sprintf("%03d", as.integer(julian_day)),
+      n_rows_written = nrow(x),
+      n_rows_total = nrow(merged),
+      n_online_found = sum(merged$online_found, na.rm = TRUE),
+      n_local_found = sum(merged$local_found, na.rm = TRUE),
+      n_local_ok = sum(merged$catalog_status == "expected_online_local", na.rm = TRUE),
+      n_missing_online = sum(merged$catalog_status == "expected_missing_online", na.rm = TRUE),
+      n_missing_local = sum(merged$catalog_status == "expected_online_missing_local", na.rm = TRUE),
+      catalog_csv = normalizePath(csv_path, winslash = "/", mustWork = FALSE),
+      catalog_dir = normalizePath(out_dir, winslash = "/", mustWork = FALSE),
+      updated_at_utc = goes_cd_now_utc_chr(),
+      stringsAsFactors = FALSE
+    )
+  })
+
+  do.call(rbind, manifest)
+}
+
+# ------------------------------------------------------------------------------
+# Request selection and download plan
+# ------------------------------------------------------------------------------
+
+goes_cd_select_rows_for_request <- function(catalog, params) {
+
+  if (is.null(catalog) || nrow(catalog) == 0) {
+    return(catalog)
+  }
+
+  catalog <- catalog[catalog$online_found, , drop = FALSE]
+
+  if (nrow(catalog) == 0) {
+    return(catalog)
+  }
+
+  expected_time <- goes_cd_parse_utc_chr(catalog$expected_time_utc)
+  from_utc <- as.POSIXct(params$from_utc, tz = "UTC")
+  to_utc <- as.POSIXct(params$to_utc, tz = "UTC")
+
+  if (params$date_mode == "Now (Last file online)") {
+
+    x <- catalog[expected_time <= from_utc, , drop = FALSE]
+
+    if (nrow(x) == 0) {
+      return(x)
+    }
+
+    x_time <- goes_cd_parse_utc_chr(x$expected_time_utc)
+    split_key <- paste(x$product)
+
+    out <- lapply(split(x, split_key), function(z) {
+      z_time <- goes_cd_parse_utc_chr(z$expected_time_utc)
+      z[which.max(z_time), , drop = FALSE]
+    })
+
+    return(do.call(rbind, out))
+  }
+
+  if (params$time_mode %in% c("Full day", "Time range")) {
+
+    x <- catalog[
+      expected_time >= from_utc &
+        expected_time <= to_utc,
+      ,
+      drop = FALSE
+    ]
+
+    if (
+      params$time_mode == "Time range" &&
+      !is.null(params$time_range_files) &&
+      params$time_range_files == "Only the first file of each hour of each day" &&
+      nrow(x) > 0
+    ) {
+
+      x$hour_key_tmp <- format(
+        goes_cd_parse_utc_chr(x$expected_time_utc),
+        "%Y-%m-%d %H",
+        tz = "UTC"
+      )
+
+      split_key <- paste(x$product, x$gregorian_date, x$hour_key_tmp)
+
+      out <- lapply(split(x, split_key), function(z) {
+        z_time <- goes_cd_parse_utc_chr(z$expected_time_utc)
+        z[which.min(z_time), , drop = FALSE]
+      })
+
+      x <- do.call(rbind, out)
+      x$hour_key_tmp <- NULL
+    }
+
+    return(x)
+  }
+
+  if (params$time_mode == "Single hour") {
+
+    target_time <- format(from_utc, "%H:%M:%S", tz = "UTC")
+    rule <- params$single_hour_search
+
+    split_key <- paste(catalog$product, catalog$gregorian_date)
+
+    out <- lapply(split(catalog, split_key), function(z) {
+
+      target <- as.POSIXct(
+        paste(z$gregorian_date[[1]], target_time),
+        tz = "UTC"
+      )
+
+      z_time <- goes_cd_parse_utc_chr(z$expected_time_utc)
+      delta <- as.numeric(difftime(z_time, target, units = "secs"))
+
+      if (rule == "Exact") {
+        idx <- which(delta == 0)
+      } else if (rule == "Less than or equal") {
+        idx <- which(delta <= 0)
+        if (length(idx) > 0) idx <- idx[which.max(z_time[idx])]
+      } else if (rule == "Greater than or equal") {
+        idx <- which(delta >= 0)
+        if (length(idx) > 0) idx <- idx[which.min(z_time[idx])]
+      } else if (rule == "Less than") {
+        idx <- which(delta < 0)
+        if (length(idx) > 0) idx <- idx[which.max(z_time[idx])]
+      } else if (rule == "Greater than") {
+        idx <- which(delta > 0)
+        if (length(idx) > 0) idx <- idx[which.min(z_time[idx])]
+      } else {
+        idx <- integer()
+      }
+
+      if (length(idx) == 0) {
+        return(z[0, , drop = FALSE])
+      }
+
+      z[idx[1], , drop = FALSE]
+    })
+
+    return(do.call(rbind, out))
+  }
+
+  catalog[0, , drop = FALSE]
+}
+
+goes_cd_action_from_row <- function(local_found, size_match) {
+
+  if (isTRUE(local_found) && isTRUE(size_match)) {
+    return("OK")
+  }
+
+  if (isTRUE(local_found) && !isTRUE(size_match)) {
+    return("Delete and Download")
+  }
+
+  "Download"
+}
+
+goes_cd_make_plan_from_catalog <- function(
+    catalog,
+    params,
+    data_raw_dir,
+    catalog_base_dir
+) {
+
+  selected <- goes_cd_select_rows_for_request(
+    catalog = catalog,
+    params = params
+  )
+
+  if (is.null(selected) || nrow(selected) == 0) {
+    return(list(
+      selected = data.frame(),
+      pending = data.frame()
+    ))
+  }
+
+  selected$download_action <- vapply(
+    seq_len(nrow(selected)),
+    function(i) {
+      goes_cd_action_from_row(
+        local_found = selected$local_found[[i]],
+        size_match = selected$size_match[[i]]
+      )
+    },
+    character(1)
+  )
+
+  selected$catalog_csv <- file.path(
+    goes_cd_catalog_group_dir(
+      catalog_base_dir = catalog_base_dir,
+      bucket = selected$bucket,
+      product_code = selected$product_code,
+      year = selected$year,
+      julian_day = selected$julian_day
+    ),
+    "catalog.csv"
+  )
+
+  pending <- selected[
+    selected$download_action %in% c("Download", "Delete and Download"),
+    ,
+    drop = FALSE
+  ]
+
+  list(
+    selected = selected,
+    pending = pending
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Update catalog row after each download
+# ------------------------------------------------------------------------------
+
+goes_cd_update_catalog_row_in_file <- function(
+    catalog_csv,
+    catalog_id,
+    updates
+) {
+
+  if (!file.exists(catalog_csv)) {
+    stop("Catalog file does not exist: ", catalog_csv)
+  }
+
+  x <- utils::read.csv(
+    catalog_csv,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  idx <- which(x$catalog_id == catalog_id)
+
+  if (length(idx) == 0) {
+    stop("catalog_id not found in catalog: ", catalog_id)
+  }
+
+  idx <- idx[1]
+
+  for (nm in names(updates)) {
+    if (!nm %in% names(x)) {
+      x[[nm]] <- NA
+    }
+    x[[nm]][idx] <- updates[[nm]]
+  }
+
+  x <- goes_cd_update_catalog_status(x)
+
+  utils::write.csv(
+    x,
+    catalog_csv,
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+
+  invisible(TRUE)
+}
+
+goes_cd_download_pending_files <- function(
+    pending,
+    log_fun = message
+) {
+
+  if (is.null(pending) || nrow(pending) == 0) {
+    return(data.frame())
+  }
+
+  status <- data.frame(
+    catalog_id = pending$catalog_id,
+    product = pending$product,
+    file = pending$online_filename,
+    destination = pending$local_path,
+    status = rep("pending", nrow(pending)),
+    detail = rep("", nrow(pending)),
+    stringsAsFactors = FALSE
+  )
+
+  for (i in seq_len(nrow(pending))) {
+
+    log_fun(sprintf(
+      "[%d/%d] Downloading %s",
+      i,
+      nrow(pending),
+      pending$online_filename[[i]]
+    ))
+
+    destination <- pending$local_path[[i]]
+    url <- pending$online_url[[i]]
+    expected_size <- pending$online_size_bytes[[i]]
+    catalog_csv <- pending$catalog_csv[[i]]
+    catalog_id <- pending$catalog_id[[i]]
+
+    ok <- tryCatch(
+      {
+        dir.create(dirname(destination), recursive = TRUE, showWarnings = FALSE)
+
+        if (
+          file.exists(destination) &&
+          pending$download_action[[i]] == "Delete and Download"
+        ) {
+          unlink(destination)
+        }
+
+        utils::download.file(
+          url = url,
+          destfile = destination,
+          mode = "wb",
+          quiet = TRUE
+        )
+
+        local_found <- file.exists(destination)
+        local_size <- goes_cd_safe_file_size(destination)
+        size_match <- local_found &&
+          !is.na(local_size) &&
+          !is.na(expected_size) &&
+          local_size == expected_size
+
+        goes_cd_update_catalog_row_in_file(
+          catalog_csv = catalog_csv,
+          catalog_id = catalog_id,
+          updates = list(
+            local_checked = TRUE,
+            local_found = local_found,
+            local_filename = basename(destination),
+            local_path = normalizePath(destination, winslash = "/", mustWork = FALSE),
+            local_size_bytes = local_size,
+            size_match = size_match,
+            download_status = ifelse(size_match, "ok", "size_mismatch"),
+            downloaded_at_utc = goes_cd_now_utc_chr(),
+            download_error = NA_character_,
+            last_checked_at_utc = goes_cd_now_utc_chr()
+          )
+        )
+
+        size_match
+      },
+      error = function(e) {
+
+        goes_cd_update_catalog_row_in_file(
+          catalog_csv = catalog_csv,
+          catalog_id = catalog_id,
+          updates = list(
+            download_status = "error",
+            download_error = conditionMessage(e),
+            last_checked_at_utc = goes_cd_now_utc_chr()
+          )
+        )
+
+        status$status[[i]] <- "error"
+        status$detail[[i]] <- conditionMessage(e)
+        FALSE
+      }
+    )
+
+    if (isTRUE(ok)) {
+      status$status[[i]] <- "ok"
+      status$detail[[i]] <- "Downloaded and size matched."
+    } else if (status$status[[i]] != "error") {
+      status$status[[i]] <- "error"
+      status$detail[[i]] <- "Downloaded, but size did not match."
+    }
+  }
+
+  status
+}

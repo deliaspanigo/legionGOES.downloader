@@ -1,0 +1,746 @@
+library(shiny)
+library(shinyjs)
+
+horas <- sprintf("%02d", 0:23)
+min_seg <- sprintf("%02d", 0:59)
+
+# Tabla de satélites operativos por sector y fecha/hora UTC
+tabla_goes <- data.frame(
+  sector = c("EAST", "EAST", "WEST", "WEST"),
+  goes = c("GOES-16", "GOES-19", "GOES-17", "GOES-18"),
+  inicio_utc = as.POSIXct(
+    c(
+      "2017-12-18 00:00:00",  # GOES-16 como GOES-East
+      "2025-04-07 15:00:00",  # GOES-19 como GOES-East
+      "2019-02-12 00:00:00",  # GOES-17 como GOES-West
+      "2023-01-04 18:00:00"   # GOES-18 como GOES-West
+    ),
+    tz = "UTC"
+  ),
+  fin_utc = as.POSIXct(
+    c(
+      "2025-04-07 15:00:00",
+      NA,
+      "2023-01-04 18:00:00",
+      NA
+    ),
+    tz = "UTC"
+  )
+)
+
+detectar_goes <- function(sector, fecha_hora_utc) {
+  
+  x <- tabla_goes[tabla_goes$sector == sector, ]
+  
+  ok <- fecha_hora_utc >= x$inicio_utc &
+    (is.na(x$fin_utc) | fecha_hora_utc < x$fin_utc)
+  
+  if (!any(ok)) {
+    return(NA_character_)
+  }
+  
+  x$goes[ok][1]
+}
+
+detalle_goes_rango <- function(sector, desde_utc, hasta_utc) {
+  
+  x <- tabla_goes[tabla_goes$sector == sector, ]
+  
+  fin_aux <- x$fin_utc
+  fin_aux[is.na(fin_aux)] <- as.POSIXct("9999-12-31 00:00:00", tz = "UTC")
+  
+  cruza <- desde_utc < fin_aux & hasta_utc >= x$inicio_utc
+  
+  x <- x[cruza, ]
+  fin_aux <- fin_aux[cruza]
+  
+  if (nrow(x) == 0) {
+    return(
+      "No se pudo determinar el satélite GOES para ese rango. Puede ser una fecha anterior al período cargado en la tabla de referencia."
+    )
+  }
+  
+  desde_parte <- pmax(x$inicio_utc, desde_utc)
+  hasta_parte <- pmin(fin_aux, hasta_utc)
+  
+  partes <- paste0(
+    x$goes,
+    " desde ",
+    format(desde_parte, "%Y-%m-%d %H:%M:%S UTC", tz = "UTC"),
+    " hasta ",
+    format(hasta_parte, "%Y-%m-%d %H:%M:%S UTC", tz = "UTC")
+  )
+  
+  if (nrow(x) == 1) {
+    paste0("Satélite correspondiente: ", partes, ".")
+  } else {
+    paste0(
+      "Atención: el rango seleccionado cruza una transición de satélite. ",
+      "Se usarán: ",
+      paste(partes, collapse = "; "),
+      "."
+    )
+  }
+}
+
+ui <- fluidPage(
+  
+  useShinyjs(),
+  
+  titlePanel("Aplicación Shiny"),
+  
+  # Relojes superiores
+  fluidRow(
+    column(
+      width = 6,
+      wellPanel(
+        strong("Hora UTC"),
+        br(),
+        textOutput("reloj_utc")
+      )
+    ),
+    column(
+      width = 6,
+      wellPanel(
+        strong("Hora del sistema"),
+        br(),
+        textOutput("reloj_sistema")
+      )
+    )
+  ),
+  
+  # Fila 1: WEST / EAST
+  fluidRow(
+    column(
+      width = 4,
+      selectInput(
+        inputId = "sector",
+        label = "Sector",
+        choices = c("WEST", "EAST"),
+        selected = "WEST"
+      )
+    )
+  ),
+  
+  # Fila 2: Días
+  fluidRow(
+    column(
+      width = 4,
+      selectInput(
+        inputId = "tipo_dias",
+        label = "Días",
+        choices = c(
+          "Ahora (Last file online)",
+          "Día único",
+          "Rango de días"
+        ),
+        selected = "Ahora (Last file online)"
+      )
+    ),
+    column(
+      width = 4,
+      dateInput(
+        inputId = "fecha_from",
+        label = "From",
+        value = as.Date(Sys.time(), tz = "UTC"),
+        format = "yyyy-mm-dd",
+        language = "es"
+      ),
+      div(
+        style = "font-size: 12px; color: #666;",
+        textOutput("juliano_from")
+      )
+    ),
+    column(
+      width = 4,
+      dateInput(
+        inputId = "fecha_to",
+        label = "To",
+        value = as.Date(Sys.time(), tz = "UTC"),
+        format = "yyyy-mm-dd",
+        language = "es"
+      ),
+      div(
+        style = "font-size: 12px; color: #666;",
+        textOutput("juliano_to")
+      )
+    )
+  ),
+  
+  # Fila 3: Horas
+  fluidRow(
+    column(
+      width = 4,
+      selectInput(
+        inputId = "tipo_horas",
+        label = "Horas",
+        choices = c("Completo", "Hora única", "Rango de horas"),
+        selected = "Completo"
+      )
+    ),
+    
+    column(
+      width = 4,
+      h4("From"),
+      fluidRow(
+        column(
+          width = 4,
+          selectInput(
+            inputId = "hora_from",
+            label = "Hora",
+            choices = horas,
+            selected = "00",
+            selectize = FALSE
+          )
+        ),
+        column(
+          width = 4,
+          selectInput(
+            inputId = "min_from",
+            label = "Min",
+            choices = min_seg,
+            selected = "00",
+            selectize = FALSE
+          )
+        ),
+        column(
+          width = 4,
+          selectInput(
+            inputId = "seg_from",
+            label = "Seg",
+            choices = min_seg,
+            selected = "00",
+            selectize = FALSE
+          )
+        )
+      )
+    ),
+    
+    column(
+      width = 4,
+      h4("To"),
+      fluidRow(
+        column(
+          width = 4,
+          selectInput(
+            inputId = "hora_to",
+            label = "Hora",
+            choices = c("", horas),
+            selected = "23",
+            selectize = FALSE
+          )
+        ),
+        column(
+          width = 4,
+          selectInput(
+            inputId = "min_to",
+            label = "Min",
+            choices = c("", min_seg),
+            selected = "59",
+            selectize = FALSE
+          )
+        ),
+        column(
+          width = 4,
+          selectInput(
+            inputId = "seg_to",
+            label = "Seg",
+            choices = c("", min_seg),
+            selected = "59",
+            selectize = FALSE
+          )
+        )
+      )
+    )
+  ),
+  
+  # Selector de búsqueda para hora única
+  hidden(
+    div(
+      id = "panel_busqueda_hora_unica",
+      fluidRow(
+        column(
+          width = 6,
+          selectInput(
+            inputId = "tipo_busqueda_hora_unica",
+            label = "Búsqueda para hora única",
+            choices = c(
+              "Igual o superior",
+              "Igual o inferior",
+              "Superior",
+              "Inferior",
+              "Exacto"
+            ),
+            selected = "Exacto"
+          )
+        )
+      )
+    )
+  ),
+  
+  # Selector de archivos para rango de hora
+  hidden(
+    div(
+      id = "panel_archivos_rango_hora",
+      fluidRow(
+        column(
+          width = 6,
+          selectInput(
+            inputId = "tipo_archivos_rango_hora",
+            label = "Archivos para Rango de hora",
+            choices = c(
+              "Todos los archivos en el rango de tiempo",
+              "Solo primer archivo de cada hora de cada día"
+            ),
+            selected = "Todos los archivos en el rango de tiempo"
+          )
+        )
+      )
+    )
+  ),
+  
+  # Fila 5: Productos
+  fluidRow(
+    column(
+      width = 4,
+      radioButtons(
+        inputId = "producto",
+        label = "Productos",
+        choices = c("LSTF", "MCMIPF", "FDCF", "GLM"),
+        selected = "LSTF"
+      )
+    )
+  ),
+  
+  hr(),
+  
+  # Resumen final
+  fluidRow(
+    column(
+      width = 12,
+      h4("Resumen de descarga"),
+      wellPanel(
+        textOutput("frase_descarga")
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  # Reloj UTC
+  output$reloj_utc <- renderText({
+    invalidateLater(1000, session)
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S UTC", tz = "UTC")
+  })
+  
+  # Reloj del sistema
+  output$reloj_sistema <- renderText({
+    invalidateLater(1000, session)
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+  })
+  
+  # Fecha juliana From
+  output$juliano_from <- renderText({
+    req(input$fecha_from)
+    
+    fecha <- as.Date(input$fecha_from)
+    dia_juliano <- format(fecha, "%j")
+    anio <- format(fecha, "%Y")
+    
+    paste0("Día: ", dia_juliano, " | Año: ", anio)
+  })
+  
+  # Fecha juliana To
+  output$juliano_to <- renderText({
+    req(input$fecha_to)
+    
+    fecha <- as.Date(input$fecha_to)
+    dia_juliano <- format(fecha, "%j")
+    anio <- format(fecha, "%Y")
+    
+    paste0("Día: ", dia_juliano, " | Año: ", anio)
+  })
+  
+  # Bloquear controles de hora
+  bloquear_horas <- function() {
+    disable("tipo_horas")
+    disable("hora_from")
+    disable("min_from")
+    disable("seg_from")
+    disable("hora_to")
+    disable("min_to")
+    disable("seg_to")
+    disable("tipo_busqueda_hora_unica")
+  }
+  
+  # Aplicar Ahora / Last file online
+  aplicar_ahora <- function() {
+    
+    ahora <- Sys.time()
+    
+    # Para buscar el último archivo online se usa UTC,
+    # no la hora local del sistema.
+    fecha_utc <- as.Date(ahora, tz = "UTC")
+    hora_utc <- format(ahora, "%H", tz = "UTC")
+    min_utc <- format(ahora, "%M", tz = "UTC")
+    seg_utc <- format(ahora, "%S", tz = "UTC")
+    
+    updateDateInput(session, "fecha_from", value = fecha_utc)
+    updateDateInput(session, "fecha_to", value = fecha_utc)
+    
+    # Último archivo implica Hora única
+    updateSelectInput(session, "tipo_horas", selected = "Hora única")
+    
+    # Último archivo implica criterio Igual o inferior
+    updateSelectInput(
+      session,
+      "tipo_busqueda_hora_unica",
+      selected = "Igual o inferior"
+    )
+    
+    updateSelectInput(session, "hora_from", selected = hora_utc)
+    updateSelectInput(session, "min_from", selected = min_utc)
+    updateSelectInput(session, "seg_from", selected = seg_utc)
+    
+    updateSelectInput(session, "hora_to", selected = "")
+    updateSelectInput(session, "min_to", selected = "")
+    updateSelectInput(session, "seg_to", selected = "")
+    
+    show("panel_busqueda_hora_unica")
+    hide("panel_archivos_rango_hora")
+    
+    disable("fecha_from")
+    disable("fecha_to")
+    bloquear_horas()
+  }
+  
+  # Mostrar u ocultar paneles auxiliares
+  observe({
+    req(input$tipo_horas, input$tipo_dias)
+    
+    if (input$tipo_horas == "Hora única") {
+      show("panel_busqueda_hora_unica")
+    } else {
+      hide("panel_busqueda_hora_unica")
+    }
+    
+    if (
+      input$tipo_horas == "Rango de horas" &&
+      input$tipo_dias != "Ahora (Last file online)"
+    ) {
+      show("panel_archivos_rango_hora")
+    } else {
+      hide("panel_archivos_rango_hora")
+    }
+  })
+  
+  # Lógica de días
+  observeEvent(input$tipo_dias, {
+    
+    if (input$tipo_dias == "Ahora (Last file online)") {
+      aplicar_ahora()
+    }
+    
+    if (input$tipo_dias == "Día único") {
+      
+      enable("fecha_from")
+      disable("fecha_to")
+      enable("tipo_horas")
+      enable("tipo_busqueda_hora_unica")
+      
+      updateDateInput(session, "fecha_to", value = input$fecha_from)
+    }
+    
+    if (input$tipo_dias == "Rango de días") {
+      
+      enable("fecha_from")
+      enable("fecha_to")
+      enable("tipo_horas")
+      enable("tipo_busqueda_hora_unica")
+    }
+    
+  }, ignoreInit = FALSE)
+  
+  # Si es Día único, To copia siempre a From
+  observeEvent(input$fecha_from, {
+    
+    if (input$tipo_dias == "Día único") {
+      updateDateInput(session, "fecha_to", value = input$fecha_from)
+    }
+    
+  })
+  
+  # Lógica de horas
+  observe({
+    
+    req(input$tipo_horas)
+    
+    if (input$tipo_dias == "Ahora (Last file online)") {
+      return()
+    }
+    
+    if (input$tipo_horas == "Completo") {
+      
+      updateSelectInput(session, "hora_from", selected = "00")
+      updateSelectInput(session, "min_from", selected = "00")
+      updateSelectInput(session, "seg_from", selected = "00")
+      
+      updateSelectInput(session, "hora_to", selected = "23")
+      updateSelectInput(session, "min_to", selected = "59")
+      updateSelectInput(session, "seg_to", selected = "59")
+      
+      disable("hora_from")
+      disable("min_from")
+      disable("seg_from")
+      
+      disable("hora_to")
+      disable("min_to")
+      disable("seg_to")
+    }
+    
+    if (input$tipo_horas == "Hora única") {
+      
+      enable("hora_from")
+      enable("min_from")
+      enable("seg_from")
+      enable("tipo_busqueda_hora_unica")
+      
+      updateSelectInput(session, "hora_to", selected = "")
+      updateSelectInput(session, "min_to", selected = "")
+      updateSelectInput(session, "seg_to", selected = "")
+      
+      disable("hora_to")
+      disable("min_to")
+      disable("seg_to")
+    }
+    
+    if (input$tipo_horas == "Rango de horas") {
+      
+      enable("hora_from")
+      enable("min_from")
+      enable("seg_from")
+      
+      enable("hora_to")
+      enable("min_to")
+      enable("seg_to")
+      
+      if (is.null(input$hora_to) || input$hora_to == "") {
+        updateSelectInput(session, "hora_to", selected = "23")
+      }
+      
+      if (is.null(input$min_to) || input$min_to == "") {
+        updateSelectInput(session, "min_to", selected = "59")
+      }
+      
+      if (is.null(input$seg_to) || input$seg_to == "") {
+        updateSelectInput(session, "seg_to", selected = "59")
+      }
+    }
+    
+  })
+  
+  # Construir fecha/hora UTC inicial y final para determinar GOES
+  rango_fecha_hora_utc <- reactive({
+    
+    req(input$fecha_from, input$fecha_to, input$tipo_horas)
+    
+    fecha_from <- format(as.Date(input$fecha_from), "%Y-%m-%d")
+    fecha_to <- format(as.Date(input$fecha_to), "%Y-%m-%d")
+    
+    if (input$tipo_dias == "Ahora (Last file online)") {
+      
+      hora_from <- paste(input$hora_from, input$min_from, input$seg_from, sep = ":")
+      
+      desde_utc <- as.POSIXct(
+        paste(fecha_from, hora_from),
+        tz = "UTC"
+      )
+      
+      hasta_utc <- desde_utc
+      
+    } else if (input$tipo_horas == "Completo") {
+      
+      desde_utc <- as.POSIXct(
+        paste(fecha_from, "00:00:00"),
+        tz = "UTC"
+      )
+      
+      hasta_utc <- as.POSIXct(
+        paste(fecha_to, "23:59:59"),
+        tz = "UTC"
+      )
+      
+    } else if (input$tipo_horas == "Hora única") {
+      
+      hora_from <- paste(input$hora_from, input$min_from, input$seg_from, sep = ":")
+      
+      desde_utc <- as.POSIXct(
+        paste(fecha_from, hora_from),
+        tz = "UTC"
+      )
+      
+      hasta_utc <- as.POSIXct(
+        paste(fecha_to, hora_from),
+        tz = "UTC"
+      )
+      
+    } else if (input$tipo_horas == "Rango de horas") {
+      
+      hora_from <- paste(input$hora_from, input$min_from, input$seg_from, sep = ":")
+      hora_to <- paste(input$hora_to, input$min_to, input$seg_to, sep = ":")
+      
+      desde_utc <- as.POSIXct(
+        paste(fecha_from, hora_from),
+        tz = "UTC"
+      )
+      
+      hasta_utc <- as.POSIXct(
+        paste(fecha_to, hora_to),
+        tz = "UTC"
+      )
+    }
+    
+    list(
+      desde_utc = desde_utc,
+      hasta_utc = hasta_utc
+    )
+  })
+  
+  # Frase explicativa para el usuario
+  output$frase_descarga <- renderText({
+    
+    req(input$sector, input$producto, input$tipo_dias, input$tipo_horas)
+    
+    fecha_from <- format(as.Date(input$fecha_from), "%Y-%m-%d")
+    fecha_to <- format(as.Date(input$fecha_to), "%Y-%m-%d")
+    
+    dia_juliano_from <- format(as.Date(input$fecha_from), "%j")
+    anio_from <- format(as.Date(input$fecha_from), "%Y")
+    
+    dia_juliano_to <- format(as.Date(input$fecha_to), "%j")
+    anio_to <- format(as.Date(input$fecha_to), "%Y")
+    
+    hora_from <- paste(input$hora_from, input$min_from, input$seg_from, sep = ":")
+    
+    rango_utc <- rango_fecha_hora_utc()
+    
+    detalle_goes <- detalle_goes_rango(
+      sector = input$sector,
+      desde_utc = rango_utc$desde_utc,
+      hasta_utc = rango_utc$hasta_utc
+    )
+    
+    if (input$tipo_dias == "Ahora (Last file online)") {
+      
+      paste0(
+        "Está descargando el último archivo disponible en línea para el sector ",
+        input$sector,
+        ", producto ",
+        input$producto,
+        ". Para esta búsqueda se usa la fecha y hora UTC actual: ",
+        fecha_from,
+        " ",
+        hora_from,
+        " UTC. Este modo implica una hora única y el criterio de búsqueda igual o inferior a ese momento. ",
+        "Fecha juliana: día ",
+        dia_juliano_from,
+        ", año ",
+        anio_from,
+        ". ",
+        detalle_goes
+      )
+      
+    } else if (input$tipo_horas == "Completo") {
+      
+      paste0(
+        "Está descargando archivos del sector ",
+        input$sector,
+        ", producto ",
+        input$producto,
+        ", para ",
+        tolower(input$tipo_dias),
+        ", desde ",
+        fecha_from,
+        " 00:00:00 UTC hasta ",
+        fecha_to,
+        " 23:59:59 UTC, usando el día completo. ",
+        "Fecha juliana inicial: día ",
+        dia_juliano_from,
+        ", año ",
+        anio_from,
+        ". Fecha juliana final: día ",
+        dia_juliano_to,
+        ", año ",
+        anio_to,
+        ". ",
+        detalle_goes
+      )
+      
+    } else if (input$tipo_horas == "Hora única") {
+      
+      paste0(
+        "Está descargando archivos del sector ",
+        input$sector,
+        ", producto ",
+        input$producto,
+        ", para ",
+        tolower(input$tipo_dias),
+        ", desde ",
+        fecha_from,
+        " hasta ",
+        fecha_to,
+        ", usando una hora única: ",
+        hora_from,
+        " UTC, con criterio de búsqueda: ",
+        input$tipo_busqueda_hora_unica,
+        ". Fecha juliana inicial: día ",
+        dia_juliano_from,
+        ", año ",
+        anio_from,
+        ". Fecha juliana final: día ",
+        dia_juliano_to,
+        ", año ",
+        anio_to,
+        ". ",
+        detalle_goes
+      )
+      
+    } else if (input$tipo_horas == "Rango de horas") {
+      
+      hora_to <- paste(input$hora_to, input$min_to, input$seg_to, sep = ":")
+      
+      paste0(
+        "Está descargando archivos del sector ",
+        input$sector,
+        ", producto ",
+        input$producto,
+        ", para ",
+        tolower(input$tipo_dias),
+        ", desde ",
+        fecha_from,
+        " ",
+        hora_from,
+        " UTC hasta ",
+        fecha_to,
+        " ",
+        hora_to,
+        " UTC. Modo de archivos: ",
+        input$tipo_archivos_rango_hora,
+        ". Fecha juliana inicial: día ",
+        dia_juliano_from,
+        ", año ",
+        anio_from,
+        ". Fecha juliana final: día ",
+        dia_juliano_to,
+        ", año ",
+        anio_to,
+        ". ",
+        detalle_goes
+      )
+    }
+    
+  })
+}
+
+shinyApp(ui = ui, server = server)

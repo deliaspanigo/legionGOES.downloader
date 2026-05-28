@@ -1,0 +1,48 @@
+# goes_core_new_download.R
+# ------------------------------------------------------------------------------
+# Optional: download one candidate
+# ------------------------------------------------------------------------------
+
+fn_goes_download_candidate <- function(
+    candidate,
+    data_raw_dir,
+    overwrite = FALSE
+) {
+
+  if (is.null(candidate) || nrow(candidate) == 0) {
+    stop("No candidate file to download.")
+  }
+
+  destination <- fn_goes_make_local_path(
+    data_raw_dir = data_raw_dir,
+    bucket = candidate$bucket[[1]],
+    product_code = candidate$product_code[[1]],
+    start_time_utc = candidate$start_time_utc[[1]],
+    filename = candidate$file[[1]]
+  )
+
+  dir.create(dirname(destination), recursive = TRUE, showWarnings = FALSE)
+
+  if (file.exists(destination) && !overwrite) {
+    return(data.frame(
+      downloaded = FALSE,
+      reason = "File already exists.",
+      destination = destination,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  utils::download.file(
+    url = candidate$url[[1]],
+    destfile = destination,
+    mode = "wb",
+    quiet = FALSE
+  )
+
+  data.frame(
+    downloaded = file.exists(destination),
+    reason = ifelse(file.exists(destination), "Downloaded.", "Download failed."),
+    destination = destination,
+    stringsAsFactors = FALSE
+  )
+}

@@ -1,0 +1,27 @@
+{
+    "id": "600B2E72",
+    "path": "C:/Users/Legion/bulk/MyTesis/f01_software/f01_installer_legion/R_space/subpackages/pack_legionGOES.downloader/legionGOES.downloader/R/mod_goes_downloader_04.R",
+    "project_path": "R/mod_goes_downloader_04.R",
+    "type": "r_source",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1779194059953.0,
+    "source_on_save": false,
+    "relative_order": 2,
+    "properties": {
+        "tempName": "Untitled1",
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "2963,28",
+        "scrollLine": "2945"
+    },
+    "folds": "23|47|33|0|\n35|40|41|0|\n47|50|57|0|\n59|37|90|0|\n96|34|98|0|\n100|34|102|0|\n108|45|114|0|\n117|34|122|0|\n126|36|128|0|\n131|69|133|0|\n135|39|151|0|\n153|52|185|0|\n192|3|212|0|\n214|73|227|0|\n237|3|264|0|\n271|3|306|0|\n314|3|355|0|\n357|72|402|0|\n404|55|424|0|\n432|3|464|0|\n756|65|765|0|\n767|59|769|0|\n771|61|773|0|\n775|49|806|0|\n808|56|823|0|\n826|60|837|0|\n839|56|846|0|\n855|3|912|0|\n914|76|953|0|\n963|60|986|0|\n1186|100|1194|0|\n1202|3|1284|0|\n1287|52|1306|0|\n1308|77|1310|0|\n1319|3|1402|0|\n",
+    "lastKnownWriteTime": 1779198036,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1779985700890,
+    "read_only": false,
+    "read_only_alternatives": []
+}

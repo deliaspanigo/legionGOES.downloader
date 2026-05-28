@@ -1,0 +1,425 @@
+# ==============================================================================
+# MODULE: GOES 02 CATALOG + DOWNLOAD
+# File: R/mod_goes_02_catalog_download.R
+# ==============================================================================
+
+library(shiny)
+library(DT)
+
+mod_goes_02_catalog_download_ui <- function(id) {
+
+  ns <- NS(id)
+
+  tagList(
+
+    h3("GOES Catalog & Download"),
+
+    fluidRow(
+      column(
+        width = 4,
+        wellPanel(
+          h4("Actions"),
+          p("Build the expected catalog, update it with online/local information, and create the download plan."),
+          actionButton(
+            inputId = ns("build_catalog_plan"),
+            label = "Build / update catalog and plan",
+            class = "btn btn-primary"
+          ),
+          br(),
+          br(),
+          actionButton(
+            inputId = ns("download_pending"),
+            label = "Download pending files",
+            class = "btn btn-success"
+          ),
+          br(),
+          br(),
+          actionButton(
+            inputId = ns("clear_state"),
+            label = "Clear state",
+            class = "btn btn-outline-secondary"
+          )
+        )
+      ),
+      column(
+        width = 8,
+        wellPanel(
+          h4("Summary"),
+          verbatimTextOutput(ns("summary"))
+        )
+      )
+    ),
+
+    fluidRow(
+      column(
+        width = 12,
+        h4("Catalog manifest"),
+        DTOutput(ns("manifest_table"))
+      )
+    ),
+
+    fluidRow(
+      column(
+        width = 12,
+        h4("Selected files from catalog"),
+        DTOutput(ns("selected_table"))
+      )
+    ),
+
+    fluidRow(
+      column(
+        width = 12,
+        h4("Pending downloads"),
+        DTOutput(ns("pending_table"))
+      )
+    ),
+
+    fluidRow(
+      column(
+        width = 12,
+        h4("Download status"),
+        DTOutput(ns("status_table"))
+      )
+    ),
+
+    fluidRow(
+      column(
+        width = 12,
+        h4("Log"),
+        wellPanel(
+          style = paste(
+            "background: #071018;",
+            "color: #b8f7c1;",
+            "font-family: Consolas, monospace;",
+            "white-space: pre-wrap;",
+            "max-height: 360px;",
+            "overflow-y: auto;"
+          ),
+          textOutput(ns("log"), container = span)
+        )
+      )
+    )
+  )
+}
+
+mod_goes_02_catalog_download_server <- function(
+    id,
+    params_r,
+    data_raw_dir,
+    max_pages = 20
+) {
+
+  goes_cd_check_core()
+
+  moduleServer(id, function(input, output, session) {
+
+    rv <- reactiveValues(
+      catalog = NULL,
+      manifest = NULL,
+      selected = NULL,
+      pending = NULL,
+      status = NULL,
+      log = character(),
+      running = FALSE,
+      last_params = NULL
+    )
+
+    get_data_raw_dir <- function() {
+      if (is.function(data_raw_dir)) {
+        return(data_raw_dir())
+      }
+      data_raw_dir
+    }
+
+    get_catalog_base_dir <- function() {
+      goes_cd_catalog_base_dir(get_data_raw_dir())
+    }
+
+    add_log <- function(...) {
+      line <- sprintf(
+        "[%s] %s",
+        format(Sys.time(), "%Y-%m-%d %H:%M:%S UTC", tz = "UTC"),
+        paste0(..., collapse = "")
+      )
+      rv$log <- c(rv$log, line)
+    }
+
+    clear_state <- function() {
+      rv$catalog <- NULL
+      rv$manifest <- NULL
+      rv$selected <- NULL
+      rv$pending <- NULL
+      rv$status <- NULL
+      rv$log <- character()
+      rv$running <- FALSE
+      rv$last_params <- NULL
+    }
+
+    empty_dt <- function(msg) {
+      datatable(
+        data.frame(Message = msg),
+        rownames = FALSE,
+        options = list(dom = "t")
+      )
+    }
+
+    observeEvent(input$build_catalog_plan, {
+
+      tryCatch(
+        {
+          clear_state()
+
+          params <- params_r()
+
+          if (is.null(params)) {
+            stop("No parameters received from module 01.")
+          }
+
+          rv$last_params <- params
+
+          data_raw <- get_data_raw_dir()
+          catalog_base <- get_catalog_base_dir()
+
+          dir.create(data_raw, recursive = TRUE, showWarnings = FALSE)
+          dir.create(catalog_base, recursive = TRUE, showWarnings = FALSE)
+
+          add_log("Building full expected catalog...")
+          add_log("Data raw directory: ", normalizePath(data_raw, winslash = "/", mustWork = FALSE))
+          add_log("Catalog directory: ", normalizePath(catalog_base, winslash = "/", mustWork = FALSE))
+
+          catalog <- goes_cd_build_expected_catalog(params)
+
+          add_log("Expected rows: ", nrow(catalog))
+
+          add_log("Checking local files before online query...")
+          catalog <- goes_cd_apply_local_status(
+            catalog = catalog,
+            data_raw_dir = data_raw
+          )
+
+          add_log("Updating catalog with online information...")
+          catalog <- goes_cd_update_catalog_with_online(
+            catalog = catalog,
+            max_pages = max_pages,
+            log_fun = add_log
+          )
+
+          add_log("Checking local files after online match...")
+          catalog <- goes_cd_apply_local_status(
+            catalog = catalog,
+            data_raw_dir = data_raw
+          )
+
+          catalog <- goes_cd_update_catalog_status(catalog)
+
+          add_log("Writing catalog files...")
+          manifest <- goes_cd_write_catalog(
+            catalog = catalog,
+            catalog_base_dir = catalog_base
+          )
+
+          add_log("Catalog groups written: ", goes_cd_safe_nrow(manifest))
+
+          add_log("Creating download plan from catalog...")
+          plan <- goes_cd_make_plan_from_catalog(
+            catalog = catalog,
+            params = params,
+            data_raw_dir = data_raw,
+            catalog_base_dir = catalog_base
+          )
+
+          rv$catalog <- catalog
+          rv$manifest <- manifest
+          rv$selected <- plan$selected
+          rv$pending <- plan$pending
+
+          add_log("Selected files: ", goes_cd_safe_nrow(rv$selected))
+          add_log("Pending downloads: ", goes_cd_safe_nrow(rv$pending))
+
+          showNotification(
+            "Catalog and download plan updated.",
+            type = "message"
+          )
+        },
+        error = function(e) {
+          add_log("ERROR: ", conditionMessage(e))
+          showNotification(
+            paste("Error:", conditionMessage(e)),
+            type = "error"
+          )
+        }
+      )
+    })
+
+    observeEvent(input$download_pending, {
+
+      if (isTRUE(rv$running)) {
+        showNotification("A download is already running.", type = "warning")
+        return()
+      }
+
+      if (is.null(rv$pending) || nrow(rv$pending) == 0) {
+        showNotification("No pending files to download.", type = "warning")
+        return()
+      }
+
+      tryCatch(
+        {
+          rv$running <- TRUE
+          add_log("Starting pending downloads...")
+
+          status <- goes_cd_download_pending_files(
+            pending = rv$pending,
+            log_fun = add_log
+          )
+
+          rv$status <- status
+          rv$running <- FALSE
+
+          add_log("Download finished.")
+          add_log("OK: ", sum(status$status == "ok", na.rm = TRUE))
+          add_log("Errors: ", sum(status$status == "error", na.rm = TRUE))
+
+          # Refresh in-memory catalog local status after downloads
+          if (!is.null(rv$catalog)) {
+            rv$catalog <- goes_cd_apply_local_status(
+              catalog = rv$catalog,
+              data_raw_dir = get_data_raw_dir()
+            )
+
+            rv$catalog <- goes_cd_update_catalog_status(rv$catalog)
+
+            rv$manifest <- goes_cd_write_catalog(
+              catalog = rv$catalog,
+              catalog_base_dir = get_catalog_base_dir()
+            )
+          }
+
+          showNotification(
+            "Download finished.",
+            type = "message"
+          )
+        },
+        error = function(e) {
+          rv$running <- FALSE
+          add_log("DOWNLOAD ERROR: ", conditionMessage(e))
+          showNotification(
+            paste("Download error:", conditionMessage(e)),
+            type = "error"
+          )
+        }
+      )
+    })
+
+    observeEvent(input$clear_state, {
+      clear_state()
+      showNotification("State cleared.", type = "message")
+    })
+
+    output$summary <- renderText({
+
+      data_raw <- get_data_raw_dir()
+      catalog_base <- get_catalog_base_dir()
+
+      if (is.null(rv$catalog)) {
+        return(paste(
+          "No catalog has been built yet.",
+          paste0("Data raw directory: ", normalizePath(data_raw, winslash = "/", mustWork = FALSE)),
+          paste0("Catalog directory: ", normalizePath(catalog_base, winslash = "/", mustWork = FALSE)),
+          sep = "\n"
+        ))
+      }
+
+      paste(
+        paste0("Data raw directory: ", normalizePath(data_raw, winslash = "/", mustWork = FALSE)),
+        paste0("Catalog directory: ", normalizePath(catalog_base, winslash = "/", mustWork = FALSE)),
+        "",
+        paste0("Catalog rows in memory: ", nrow(rv$catalog)),
+        paste0("Catalog groups: ", goes_cd_safe_nrow(rv$manifest)),
+        paste0("Online found: ", sum(rv$catalog$online_found, na.rm = TRUE)),
+        paste0("Local found: ", sum(rv$catalog$local_found, na.rm = TRUE)),
+        paste0("Local OK: ", sum(rv$catalog$catalog_status == "expected_online_local", na.rm = TRUE)),
+        paste0("Missing online: ", sum(rv$catalog$catalog_status == "expected_missing_online", na.rm = TRUE)),
+        paste0("Missing local: ", sum(rv$catalog$catalog_status == "expected_online_missing_local", na.rm = TRUE)),
+        "",
+        paste0("Selected files for request: ", goes_cd_safe_nrow(rv$selected)),
+        paste0("Pending downloads: ", goes_cd_safe_nrow(rv$pending)),
+        paste0("Running: ", rv$running),
+        sep = "\n"
+      )
+    })
+
+    output$manifest_table <- renderDT({
+      if (is.null(rv$manifest) || nrow(rv$manifest) == 0) {
+        return(empty_dt("No catalog manifest yet."))
+      }
+
+      datatable(
+        rv$manifest,
+        rownames = FALSE,
+        filter = "top",
+        options = list(pageLength = 25, scrollX = TRUE)
+      )
+    })
+
+    output$selected_table <- renderDT({
+      if (is.null(rv$selected) || nrow(rv$selected) == 0) {
+        return(empty_dt("No selected files yet."))
+      }
+
+      datatable(
+        rv$selected,
+        rownames = FALSE,
+        filter = "top",
+        options = list(pageLength = 25, scrollX = TRUE)
+      )
+    })
+
+    output$pending_table <- renderDT({
+      if (is.null(rv$pending) || nrow(rv$pending) == 0) {
+        return(empty_dt("No pending downloads."))
+      }
+
+      datatable(
+        rv$pending,
+        rownames = FALSE,
+        filter = "top",
+        options = list(pageLength = 25, scrollX = TRUE)
+      )
+    })
+
+    output$status_table <- renderDT({
+      if (is.null(rv$status) || nrow(rv$status) == 0) {
+        return(empty_dt("No download status yet."))
+      }
+
+      datatable(
+        rv$status,
+        rownames = FALSE,
+        filter = "top",
+        options = list(pageLength = 25, scrollX = TRUE)
+      )
+    })
+
+    output$log <- renderText({
+      paste(rv$log, collapse = "\n")
+    })
+
+    return(
+      reactive({
+        list(
+          catalog = rv$catalog,
+          manifest = rv$manifest,
+          selected = rv$selected,
+          pending = rv$pending,
+          status = rv$status,
+          log = rv$log,
+          running = rv$running,
+          last_params = rv$last_params,
+          data_raw_dir = get_data_raw_dir(),
+          catalog_base_dir = get_catalog_base_dir()
+        )
+      })
+    )
+  })
+}

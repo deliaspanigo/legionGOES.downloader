@@ -1,0 +1,71 @@
+
+
+tb_goes_satellite_time <- data.frame(
+  position = c("EAST", "EAST", "WEST", "WEST"),
+  satellite = c("GOES-16", "GOES-19", "GOES-17", "GOES-18"),
+  bucket = c("noaa-goes16", "noaa-goes19", "noaa-goes17", "noaa-goes18"),
+  start_utc = as.POSIXct(
+    c(
+      "2017-12-18 00:00:00",
+      "2025-04-07 15:00:00",
+      "2019-02-12 00:00:00",
+      "2023-01-04 18:00:00"
+    ),
+    tz = "UTC"
+  ),
+  end_utc = as.POSIXct(
+    c(
+      "2025-04-07 15:00:00",
+      NA,
+      "2023-01-04 18:00:00",
+      NA
+    ),
+    tz = "UTC"
+  ),
+  stringsAsFactors = FALSE
+)
+
+fn_goes_resolve_satellite_by_time <- function(position, time_utc) {
+
+  position <- toupper(position)
+
+  if (!position %in% c("EAST", "WEST")) {
+    stop("position must be 'EAST' or 'WEST'.")
+  }
+
+  time_utc <- as.POSIXct(time_utc, tz = "UTC")
+
+  out <- lapply(seq_along(time_utc), function(i) {
+
+    x <- tb_goes_satellite_time[
+      tb_goes_satellite_time$position == position,
+      ,
+      drop = FALSE
+    ]
+
+    end_aux <- x$end_utc
+    end_aux[is.na(end_aux)] <- as.POSIXct("9999-12-31 00:00:00", tz = "UTC")
+
+    ok <- time_utc[[i]] >= x$start_utc & time_utc[[i]] < end_aux
+
+    if (!any(ok)) {
+      return(data.frame(
+        position = position,
+        time_utc = time_utc[[i]],
+        satellite = NA_character_,
+        bucket = NA_character_,
+        stringsAsFactors = FALSE
+      ))
+    }
+
+    data.frame(
+      position = position,
+      time_utc = time_utc[[i]],
+      satellite = x$satellite[ok][1],
+      bucket = x$bucket[ok][1],
+      stringsAsFactors = FALSE
+    )
+  })
+
+  do.call(rbind, out)
+}

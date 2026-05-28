@@ -1,0 +1,7 @@
+^dev$
+^dev/
+^.*\.Rproj$
+^\.Rproj\.user$
+^\.git$
+^\.gitignore$
+^LICENSE\.md$
